@@ -19,7 +19,6 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
-	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -36,35 +35,77 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+// type Rows struct {
+// 	schema        *arrow.Schema
+// 	records       []arrow.Record
+// 	currentRecord int
+// 	currentRow    int
+// }
+
+// /////////////////////////////////////////////////////////
 type Rows struct {
 	schema        *arrow.Schema
-	records       []arrow.Record
-	currentRecord int
-	currentRow    int
+	flightReaders []*flight.Reader
+	currentRecord arrow.Record
+	currentRow    uint
 }
+
+const fixedCurrentFlightReader = 0
+
+// // Columns returns the names of the columns.
+// func (r *Rows) Columns() []string {
+// 	if len(r.records) == 0 {
+// 		return nil
+// 	}
+
+// 	// All records have the same columns
+// 	var cols []string
+// 	for _, c := range r.schema.Fields() {
+// 		cols = append(cols, c.Name)
+// 	}
+
+// 	return cols
+// }
 
 // Columns returns the names of the columns.
 func (r *Rows) Columns() []string {
-	if len(r.records) == 0 {
+	if r.schema == nil || r.schema.NumFields() < 1 {
 		return nil
 	}
 
 	// All records have the same columns
-	var cols []string
-	for _, c := range r.schema.Fields() {
-		cols = append(cols, c.Name)
+	cols := make([]string, r.schema.NumFields())
+	for i, c := range r.schema.Fields() {
+		cols[i] = c.Name
 	}
 
 	return cols
 }
 
 // Close closes the rows iterator.
+// func (r *Rows) Close() error {
+// 	for _, rec := range r.records {
+// 		rec.Release()
+// 	}
+
+// 	r.currentRecord = 0
+// 	r.currentRow = 0
+
+// 	return nil
+// }
+
 func (r *Rows) Close() error {
-	for _, rec := range r.records {
-		rec.Release()
-	}
-	r.currentRecord = 0
+	r.schema = nil
 	r.currentRow = 0
+
+	if r.currentRecord != nil {
+		r.currentRecord.Release()
+		r.currentRecord = nil
+	}
+
+	for i := range r.flightReaders {
+		r.flightReaders[i].Release()
+	}
 
 	return nil
 }
@@ -78,31 +119,105 @@ func (r *Rows) Close() error {
 // The dest should not be written to outside of Next. Care
 // should be taken when closing Rows not to modify
 // a buffer held in dest.
-func (r *Rows) Next(dest []driver.Value) error {
-	if r.currentRecord >= len(r.records) {
-		return io.EOF
-	}
-	record := r.records[r.currentRecord]
+// func (r *Rows) Next(dest []driver.Value) error {
+// 	if r.currentRecord >= len(r.records) {
+// 		return io.EOF
+// 	}
+// 	record := r.records[r.currentRecord]
 
-	if int64(r.currentRow) >= record.NumRows() {
-		return ErrOutOfRange
-	}
+// 	if int64(r.currentRow) >= record.NumRows() {
+// 		return ErrOutOfRange
+// 	}
 
-	for i, arr := range record.Columns() {
-		v, err := fromArrowType(arr, r.currentRow)
-		if err != nil {
-			return err
+// 	for i, arr := range record.Columns() {
+// 		v, err := fromArrowType(arr, r.currentRow)
+// 		if err != nil {
+// 			return err
+// 		}
+// 		dest[i] = v
+// 	}
+
+// 	r.currentRow++
+// 	if int64(r.currentRow) >= record.NumRows() {
+// 		r.currentRecord++
+// 		r.currentRow = 0
+// 	}
+
+// 	return nil
+// }
+
+var ErrUndoneRecordset = fmt.Errorf("tried to use an empty or invalid recordset")
+
+func (r *Rows) nextReader() bool {
+	r.currentRow = 0
+	r.currentRecord = nil
+
+	if len(r.flightReaders) > 0 {
+		r.flightReaders[fixedCurrentFlightReader].Release()
+
+		if len(r.flightReaders) > 1 {
+			r.flightReaders = r.flightReaders[1:]
+
+			if r.flightReaders[fixedCurrentFlightReader].Next() {
+				r.currentRecord = r.flightReaders[fixedCurrentFlightReader].Record()
+				r.currentRecord.Retain()
+				return true
+			}
 		}
-		dest[i] = v
+	}
+
+	r.flightReaders = nil
+
+	return false
+}
+
+func (r *Rows) nextRecord() bool {
+	r.currentRow = 0
+
+	if len(r.flightReaders) < 1 || r.currentRecord == nil {
+		return false
+	}
+
+	r.currentRecord.Release()
+
+	if r.flightReaders[fixedCurrentFlightReader].Next() {
+		r.currentRecord = r.flightReaders[fixedCurrentFlightReader].Record()
+		r.currentRecord.Retain()
+		return true
+	}
+
+	return r.nextReader()
+}
+
+func (r *Rows) Next(dest []driver.Value) error {
+	if len(r.flightReaders) < 1 || r.currentRecord == nil || r.schema == nil {
+		return ErrUndoneRecordset
 	}
 
 	r.currentRow++
-	if int64(r.currentRow) >= record.NumRows() {
-		r.currentRecord++
-		r.currentRow = 0
-	}
 
-	return nil
+	for {
+		if int64(r.currentRow) < r.currentRecord.NumRows() {
+			for i, arr := range r.currentRecord.Columns() {
+				v, err := fromArrowType(arr, int(r.currentRow))
+				if err != nil {
+					return err
+				}
+
+				dest[i] = v
+			}
+
+			return nil
+		}
+
+		// record exhausted, no more rows.
+		if r.nextRecord() {
+			continue
+		}
+
+		// exhausted, no more readers, can wrap it up.
+		return io.EOF
+	}
 }
 
 type Result struct {
@@ -226,20 +341,61 @@ func (s *Stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driv
 		return nil, err
 	}
 
-	rows := Rows{}
+	var rows Rows
 	for _, endpoint := range info.Endpoint {
-		schema, records, err := readEndpoint(ctx, s.client, endpoint)
+		freader, err := readEndpoint(ctx, s.client, endpoint)
 		if err != nil {
 			return &rows, err
 		}
-		if rows.schema == nil {
-			rows.schema = schema
-		}
-		rows.records = append(rows.records, records...)
+
+		rows.flightReaders = append(rows.flightReaders, freader)
 	}
+
+	// set schema
+	rows.schema = rows.flightReaders[fixedCurrentFlightReader].Schema()
+
+	if !rows.flightReaders[fixedCurrentFlightReader].Next() {
+		return &rows, sql.ErrNoRows
+	}
+
+	rows.currentRecord = rows.flightReaders[fixedCurrentFlightReader].Record()
+	rows.currentRecord.Retain()
 
 	return &rows, nil
 }
+
+// // QueryContext executes a query that may return rows, such as a SELECT.
+// func (s *Stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+// 	if err := s.setParameters(args); err != nil {
+// 		return nil, err
+// 	}
+
+// 	if _, set := ctx.Deadline(); !set && s.timeout > 0 {
+// 		var cancel context.CancelFunc
+// 		ctx, cancel = context.WithTimeout(ctx, s.timeout)
+// 		defer cancel()
+// 	}
+
+// 	info, err := s.stmt.Execute(ctx)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+
+// 	rows := Rows{}
+// 	for _, endpoint := range info.Endpoint {
+// 		schema, records, err := readEndpoint(ctx, s.client, endpoint)
+// 		if err != nil {
+// 			return &rows, err
+// 		}
+
+// 		if rows.schema == nil {
+// 			rows.schema = schema
+// 		}
+// 		rows.records = append(rows.records, records...)
+// 	}
+
+// 	return &rows, nil
+// }
 
 func (s *Stmt) setParameters(args []driver.NamedValue) error {
 	if len(args) == 0 {
@@ -443,6 +599,39 @@ func (c *Connection) PrepareContext(ctx context.Context, query string) (driver.S
 	return s, nil
 }
 
+// func (c *Connection) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+// 	if len(args) > 0 {
+// 		// We cannot pass arguments to the client so we skip a direct query.
+// 		// This will force the sql-framework to prepare and execute queries.
+// 		return nil, driver.ErrSkip
+// 	}
+
+// 	if _, set := ctx.Deadline(); !set && c.timeout > 0 {
+// 		var cancel context.CancelFunc
+// 		ctx, cancel = context.WithTimeout(ctx, c.timeout)
+// 		defer cancel()
+// 	}
+
+// 	info, err := c.client.Execute(ctx, query)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+
+// 	rows := Rows{}
+// 	for _, endpoint := range info.Endpoint {
+// 		schema, records, err := readEndpoint(ctx, c.client, endpoint)
+// 		if err != nil {
+// 			return &rows, err
+// 		}
+// 		if rows.schema == nil {
+// 			rows.schema = schema
+// 		}
+// 		rows.records = append(rows.records, records...)
+// 	}
+
+// 	return &rows, nil
+// }
+
 func (c *Connection) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	if len(args) > 0 {
 		// We cannot pass arguments to the client so we skip a direct query.
@@ -461,43 +650,59 @@ func (c *Connection) QueryContext(ctx context.Context, query string, args []driv
 		return nil, err
 	}
 
-	rows := Rows{}
+	var rows Rows
 	for _, endpoint := range info.Endpoint {
-		schema, records, err := readEndpoint(ctx, c.client, endpoint)
+		freader, err := readEndpoint(ctx, c.client, endpoint)
 		if err != nil {
 			return &rows, err
 		}
-		if rows.schema == nil {
-			rows.schema = schema
-		}
-		rows.records = append(rows.records, records...)
+
+		rows.flightReaders = append(rows.flightReaders, freader)
 	}
+
+	// set schema
+	rows.schema = rows.flightReaders[fixedCurrentFlightReader].Schema()
+
+	if !rows.flightReaders[fixedCurrentFlightReader].Next() {
+		return &rows, sql.ErrNoRows
+	}
+
+	rows.currentRecord = rows.flightReaders[fixedCurrentFlightReader].Record()
+	rows.currentRecord.Retain()
 
 	return &rows, nil
-
 }
 
-func readEndpoint(ctx context.Context, client *flightsql.Client, endpoint *flight.FlightEndpoint) (*arrow.Schema, []arrow.Record, error) {
+func readEndpoint(ctx context.Context, client *flightsql.Client, endpoint *flight.FlightEndpoint) (*flight.Reader, error) {
 	reader, err := client.DoGet(ctx, endpoint.GetTicket())
 	if err != nil {
-		return nil, nil, fmt.Errorf("getting ticket failed: %w", err)
-	}
-	defer reader.Release()
-
-	schema := reader.Schema()
-	var records []arrow.Record
-	for reader.Next() {
-		record := reader.Record()
-		record.Retain()
-		records = append(records, record)
+		return nil, fmt.Errorf("getting ticket failed: %w", err)
 	}
 
-	if err := reader.Err(); err != nil && !errors.Is(err, io.EOF) {
-		return nil, nil, err
-	}
-
-	return schema, records, nil
+	return reader, nil
 }
+
+// func readEndpoint(ctx context.Context, client *flightsql.Client, endpoint *flight.FlightEndpoint) (*arrow.Schema, []arrow.Record, error) {
+// 	reader, err := client.DoGet(ctx, endpoint.GetTicket())
+// 	if err != nil {
+// 		return nil, nil, fmt.Errorf("getting ticket failed: %w", err)
+// 	}
+// 	defer reader.Release()
+
+// 	schema := reader.Schema()
+// 	var records []arrow.Record
+// 	for reader.Next() {
+// 		record := reader.Record()
+// 		record.Retain()
+// 		records = append(records, record)
+// 	}
+
+// 	if err := reader.Err(); err != nil && !errors.Is(err, io.EOF) {
+// 		return nil, nil, err
+// 	}
+
+// 	return schema, records, nil
+// }
 
 // Close invalidates and potentially stops any current
 // prepared statements and transactions, marking this
